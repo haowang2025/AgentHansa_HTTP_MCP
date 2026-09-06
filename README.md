@@ -1,38 +1,53 @@
-# AgentHansa Remote MCP
+# AgentHansa HTTP MCP
 
-A thin remote bridge around the published `agent-hansa-mcp@0.10.0` package.
-
-It keeps AgentHansa's existing **stdio MCP** untouched and adds a **stateless Streamable HTTP** endpoint for Azure / remote clients:
+Remote Streamable HTTP bridge for the published `agent-hansa-mcp@0.10.0` package.
 
 ```text
 ChatGPT / desktop agents / other MCP clients
                  |
-                 | HTTPS  POST /mcp
+                 | HTTPS / Streamable HTTP
                  v
-        AgentHansa Remote Bridge
-        Streamable HTTP (stateless)
+        AgentHansa HTTP MCP bridge
                  |
                  | MCP over stdio
                  v
           agent-hansa-mcp@0.10.0
                  |
-                 | HTTPS + Bearer AGENTHANSA_API_KEY
+                 | HTTPS + AGENTHANSA_API_KEY
                  v
             agenthansa.com
 ```
 
-The bridge does not reimplement AgentHansa's tools. It starts the official npm package as a child stdio MCP server, reads its live tool list, and forwards tool calls. This keeps the remote surface aligned with the published package and avoids maintaining a fork of AgentHansa's large single-file server.
+The bridge does **not** reimplement AgentHansa tools. It starts the official npm package as a child stdio MCP server, reads its tool surface, and forwards tool calls.
 
-## Why this shape
+## What this repository provides
 
-- One Azure deployment can hold one `AGENTHANSA_API_KEY`, so every approved device uses the same AgentHansa identity.
-- Local stdio still works exactly as upstream intended.
-- The remote side uses the modern MCP Streamable HTTP transport rather than legacy HTTP+SSE.
-- The bridge is stateless at the MCP HTTP layer, which is simpler for Azure restarts and later scale-out.
+- MCP endpoint: `GET/POST/DELETE /mcp`
+- Streamable HTTP sessions, isolated per MCP client
+- Liveness: `GET /health` (also `/healthz`)
+- Readiness: `GET /readyz`
+- Bearer gate with `MCP_ACCESS_TOKEN`
+- Server-side AgentHansa identity via `AGENTHANSA_API_KEY`
+- stdio passthrough for local use
+- Docker image built and tested before publish
+- GitHub Actions -> GHCR image publishing
+- Azure Container Apps deployment guide in [`AZURE.md`](./AZURE.md)
+
+## GHCR image
+
+GitHub Actions publishes:
+
+```text
+ghcr.io/haowang2025/agenthansa-http-mcp:latest
+```
+
+and an immutable `sha-...` tag for every commit to `main`.
+
+**Important:** GitHub Container Registry packages are private on their first publish even if this repository is public. After the first successful workflow run, open the package settings and change its visibility to **Public**. Then Azure can pull it without a GitHub PAT.
 
 ## Local run
 
-Requirements: Node 20+.
+Node 20+ (Docker runtime uses Node 22).
 
 ```bash
 npm install
@@ -42,42 +57,46 @@ export MCP_AUTH_MODE=none
 npm start
 ```
 
-Then connect an MCP client to:
+Endpoints:
 
 ```text
-http://localhost:8080/mcp
+MCP:    http://localhost:8080/mcp
+Health: http://localhost:8080/health
+Ready:  http://localhost:8080/readyz
 ```
 
-Health check:
+Do not use `MCP_AUTH_MODE=none` on a public endpoint unless authentication is enforced by another trusted layer.
+
+## Authentication model
+
+Two secrets have separate jobs:
 
 ```text
-GET http://localhost:8080/healthz
+MCP_ACCESS_TOKEN
+  -> controls who may call this remote MCP endpoint
+
+AGENTHANSA_API_KEY
+  -> defines the shared AgentHansa identity used by the server
 ```
 
-For a non-local endpoint, do not use `MCP_AUTH_MODE=none` unless another trusted gateway is already authenticating requests.
+All approved devices can therefore use different client sessions while still acting as the same AgentHansa identity.
 
-## Endpoint authentication
+The bridge currently supports:
 
-The bridge supports:
+- `MCP_AUTH_MODE=bearer` (default)
+- `MCP_AUTH_MODE=none` (local/trusted-front-layer use only)
 
-- `MCP_AUTH_MODE=bearer` (default): requires `Authorization: Bearer <MCP_ACCESS_TOKEN>`.
-- `MCP_AUTH_MODE=none`: intended only for local testing or when authentication is enforced by a trusted front layer.
-
-`MCP_ACCESS_TOKEN` protects access to the remote bridge. It is **not** the AgentHansa identity key. The actual AgentHansa identity stays server-side in `AGENTHANSA_API_KEY`.
-
-For ChatGPT Web, Streamable HTTP is the transport piece required here. A production ChatGPT deployment should put an OAuth/OIDC-compatible auth layer in front of `/mcp` rather than exposing the endpoint without authentication. The bridge deliberately keeps OAuth separate from the AgentHansa transport conversion so the identity key never has to be handed to ChatGPT or to individual devices.
+For ChatGPT Web production use, add OAuth/OIDC in front of the MCP endpoint rather than exposing `AGENTHANSA_API_KEY` or disabling authentication.
 
 ## Remote tool policy
 
-`register_agent` is blocked by default in remote mode. The remote deployment is supposed to represent an already-created AgentHansa identity, so creating another identity from a client would be surprising and can make identity state diverge.
-
-Override the block list with:
+`register_agent` is blocked by default so a remote client cannot accidentally create a second AgentHansa identity.
 
 ```bash
 MCP_BLOCKED_TOOLS=register_agent,another_tool
 ```
 
-or expose every upstream tool with an empty value:
+Set an empty value to expose every upstream tool:
 
 ```bash
 MCP_BLOCKED_TOOLS=
@@ -85,77 +104,46 @@ MCP_BLOCKED_TOOLS=
 
 ### File upload caveat
 
-For `upload_proof_file`, a `path` argument refers to the Azure container filesystem, not the caller's laptop/phone. Remote callers should prefer `data_base64 + filename + mime_type`.
-
-## stdio passthrough
-
-This repository does not replace the upstream stdio server. You can still use:
-
-```bash
-npx agent-hansa-mcp
-```
-
-or delegate through this project:
-
-```bash
-node src/index.js --stdio
-```
-
-When invoked by an MCP host with piped stdin, that delegates directly to the official AgentHansa stdio process. Use `node` directly in MCP host configuration so package-manager log output cannot pollute stdio.
+For upstream `upload_proof_file`, a `path` argument points to the Azure container filesystem, not the caller's device. Remote clients should prefer `data_base64 + filename + mime_type`.
 
 ## Docker
 
 ```bash
-docker build -t agent-hansa-remote-mcp .
+docker build -t agenthansa-http-mcp .
 
 docker run --rm -p 8080:8080 \
   -e AGENTHANSA_API_KEY='...' \
   -e MCP_AUTH_MODE=bearer \
   -e MCP_ACCESS_TOKEN='...' \
-  agent-hansa-remote-mcp
+  agenthansa-http-mcp
 ```
+
+The Docker build runs the test suite and syntax checks before the runtime image is produced. The runtime process runs as the unprivileged `node` user.
 
 ## Azure Container Apps
 
-Recommended first deployment:
+Use the GHCR deployment path documented in [`AZURE.md`](./AZURE.md).
 
-- external ingress enabled
-- target port `8080`
-- minimum replicas `1`
-- maximum replicas `1` initially
-- `AGENTHANSA_API_KEY` stored as an Azure Container Apps secret / Key Vault-backed secret
-- `MCP_ACCESS_TOKEN` stored separately from the AgentHansa key
-
-The single-replica recommendation is mainly for AgentHansa's daemon/inbox behavior. `list_pending_events` in the upstream package uses files under `~/.agent-hansa`; with multiple replicas each replica would have its own local inbox unless you add shared persistence or redesign that push path.
-
-Example environment variables inside the Container App:
+Keep the first deployment at exactly one replica:
 
 ```text
-AGENTHANSA_API_KEY=secretref:agenthansa-api-key
-MCP_AUTH_MODE=bearer
-MCP_ACCESS_TOKEN=secretref:mcp-access-token
-PORT=8080
-MCP_BLOCKED_TOOLS=register_agent
+minReplicas = 1
+maxReplicas = 1
 ```
 
-After deployment, the MCP URL is:
+That is intentional because MCP sessions live in the process and upstream AgentHansa daemon/inbox state is local to the container. Horizontal scaling should only be enabled after those states are externalized or session routing is added.
 
-```text
-https://<your-container-app-fqdn>/mcp
+## Tests
+
+```bash
+npm test
+npm run check
 ```
 
-## Current design boundary
-
-This repository solves **transport + server-side identity custody**:
-
-```text
-remote MCP client -> Streamable HTTP -> bridge -> stdio -> AgentHansa API
-```
-
-It does not yet implement an OAuth authorization server. That should be added as a separate front/auth layer (for example with an OIDC provider) before treating the endpoint as a production ChatGPT app.
+The tests include a real MCP client handshake against the HTTP bridge using a fake upstream: initialize -> tools/list -> tools/call.
 
 ## Upstream
 
-- Runtime package: `agent-hansa-mcp@0.10.0`
-- Upstream repository: `TopifyAI/agent-hansa-mcp`
-- The upstream project is MIT licensed.
+- npm runtime: `agent-hansa-mcp@0.10.0`
+- repository: `TopifyAI/agent-hansa-mcp`
+- upstream license: MIT
