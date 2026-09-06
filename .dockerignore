@@ -2,6 +2,5 @@
 .github
 node_modules
 npm-debug.log*
-test
 .env
 .env.*
