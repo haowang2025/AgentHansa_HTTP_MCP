@@ -1,0 +1,20 @@
+{
+  "name": "agent-hansa-remote-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Remote Streamable HTTP bridge for AgentHansa MCP, preserving the upstream stdio server.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/index.js --http",
+    "start:stdio": "node src/index.js --stdio",
+    "check": "node --check src/index.js && node --check src/http-server.js && node --check src/proxy-server.js && node --check src/upstream.js && node --check src/auth.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.24.3",
+    "agent-hansa-mcp": "0.10.0"
+  }
+}
